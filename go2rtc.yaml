@@ -1,0 +1,43 @@
+# go2rtc 配置（v1.9.15）
+# 启动：./bin/go2rtc -config ./go2rtc.yaml    或者用 launchd（install.sh 会装好）
+#
+# 安全说明：go2rtc 的 API 没有鉴权，谁连上 1984 端口谁就能看画面。
+# 默认只监听回环地址；需要在局域网/Home Assistant 里看的话，见下方注释改。
+
+api:
+  listen: "127.0.0.1:1984"     # 想局域网看/接 HA：改成 ":1984"
+rtsp:
+  listen: "127.0.0.1:8554"     # 想给别的机器拉流：改成 ":8554"
+webrtc:
+  listen: ":8555"              # WebUI 里点视频要用，局域网内即可
+
+log:
+  level: info
+
+# ---------------------------------------------------------------------------
+# 1) 先启动本服务，浏览器打开 http://127.0.0.1:1984
+# 2) 左上 Add → Xiaomi → 填小米账号密码 → 按提示收验证码 / 过人机校验
+# 3) 登录成功后这里会自动多出 xiaomi: 段（形如下面的样子，别手抄，会自动写）
+# 4) 在 WebUI 里把摄像头加进 streams，或手写：
+# ---------------------------------------------------------------------------
+# xiaomi:
+#   "1234567890": "V1:************"
+#
+# streams:
+#   micam2: xiaomi://1234567890:cn@192.168.1.50?did=9876543210&model=chuangmi.camera.039c01&subtype=hd
+#
+#   注意：URL 里**不要**手写 vendor / client_public / client_private / device_public / sign 这些参数，
+#   它们是每次开流时 go2rtc 向小米云（miss_get_vendor）现取的，只出现在 debug 日志里。
+#   想确认云端给这台机器选了哪个厂商协议：log: level: debug，然后找 "xiaomi: dial ... vendor=cs2|tutk|agora|mtp"。
+#
+#   # 双镜头机型取第二路：
+#   # micam2_2: xiaomi://...&channel=2
+#   #
+#   # 清晰度档位：默认 2 **不一定**是高清。039a01 实测 1/2/hd=864x480，3=2560x1440，
+#   # 所以这台机器要写 subtype=3。换机型就一档一档试，看 /api/frame.jpeg 的帧宽高：
+#   # micam2: xiaomi://...&subtype=3
+#   #
+#   # 设备只吃 H.264、或要更好的兼容性时，让 go2rtc 转码出一路（吃 CPU，M1 够用但没必要）：
+#   # micam2_h264: ffmpeg:micam2#video=h264#width=1280#height=720#audio=copy
+
+streams: {}

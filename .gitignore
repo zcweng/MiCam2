@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# 构建产物
+app/build/
+app/.build/
+*.o
+*.swiftmodule
+
+# 本地配置与密钥（绝不要提交）
+config.env
+go2rtc.yaml.bak
+*.token
+*.pem
+
+# 会话/记忆日志（含真实 IP、账号、令牌）
+.agents/memory/
