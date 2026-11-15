@@ -20,6 +20,9 @@ swiftc -O -swift-version 5 -parse-as-library -target "$TARGET" \
   Sources/*.swift 2>&1 | sed 's|Sources/||'
 
 cp Resources/Info.plist "$APP/Contents/Info.plist"
+if [ -f Resources/AppIcon.icns ]; then
+  cp Resources/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+fi
 
 # 如果本地有二进制，一并塞进去
 for b in go2rtc ffmpeg; do
@@ -28,3 +31,5 @@ done
 codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 echo "构建完成: $(pwd)/$APP"
 du -sh "$APP"
+# 刷新 Finder / Dock 图标缓存提示
+echo "若 Dock/Finder 仍显示旧图标：打开放置目录或执行 killall Dock"

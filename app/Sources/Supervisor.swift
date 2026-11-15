@@ -7,6 +7,7 @@ import Combine
 final class ChildProcess {
     let proc = Process()
     private let pipe = Pipe()
+    private let inPipe = Pipe()
     private var buffer = Data()
     private let queue = DispatchQueue(label: "micam2.child.log")
     private let onLog: (String) -> Void
@@ -19,7 +20,8 @@ final class ChildProcess {
         proc.arguments = args
         proc.standardOutput = pipe
         proc.standardError = pipe
-        proc.standardInput = FileHandle.nullDevice
+        // 保留 stdin：停录时写 "q\n"，让 ffmpeg 写完 moov/faststart 再退出
+        proc.standardInput = inPipe
         pipe.fileHandleForReading.readabilityHandler = { [weak self] h in
             let d = h.availableData
             guard let self, !d.isEmpty else { return }
@@ -43,11 +45,35 @@ final class ChildProcess {
     var isRunning: Bool { proc.isRunning }
     var pid: Int32 { proc.processIdentifier }
 
+    /// ffmpeg 交互退出：收尾当前段（写 moov）；比直接 SIGKILL 慢但文件可播
+    func quitGracefully() {
+        guard isRunning else { return }
+        let fd = inPipe.fileHandleForWriting
+        try? fd.write(contentsOf: Data("q\n".utf8))
+    }
+
     func interrupt() { if isRunning { kill(pid, SIGINT) } }
     func terminate() { if isRunning { proc.terminate() } }
     func killForce() { if isRunning { kill(pid, SIGKILL) } }
 
-    func wait() async -> Int32 {
+    /// 优雅停：q → 短暂等 → SIGINT → 等到超时 → 才 SIGKILL。
+    /// ffmpeg 收尾段（尤其 faststart）在外置盘上可能要数秒，timeout 宜 ≥10s。
+    func stopAndWait(timeout: TimeInterval = 15.0, escalate: Bool = true) async -> Int32 {
+        if isRunning {
+            if escalate {
+                quitGracefully()
+                try? await Task.sleep(nanoseconds: 400_000_000)
+                if isRunning { interrupt() }
+            } else {
+                terminate()
+            }
+        }
+        let result = await wait(timeout: timeout)
+        if isRunning { killForce() }
+        return isRunning ? await wait(timeout: 0.5) : result
+    }
+
+    func wait(timeout: TimeInterval = 3600) async -> Int32 {
         await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
             let lock = NSLock()
             var done = false
@@ -59,22 +85,32 @@ final class ChildProcess {
             }
             proc.terminationHandler = { p in finish(p.terminationStatus) }
             DispatchQueue.global().async {
-                while self.proc.isRunning { usleep(200_000) }
+                let deadline = Date().addingTimeInterval(timeout)
+                while self.proc.isRunning && Date() < deadline { usleep(50_000) }
                 finish(self.proc.terminationStatus)
             }
         }
     }
+
+    func wait() async -> Int32 { await wait(timeout: 3600) }
 }
 
 // MARK: - 运行状态
 
 enum RunState: Equatable {
-    case stopped, starting, recording, paused, failed(String)
+    case stopped, starting, recording, paused, stopping, failed(String)
 
     var isActive: Bool {
         switch self {
-        case .recording, .starting, .paused: return true
+        case .recording, .starting, .paused, .stopping: return true
         case .stopped, .failed: return false
+        }
+    }
+    /// 可以点「停止」：录制/暂停/启动中；停止中与已停止不可再点
+    var canStop: Bool {
+        switch self {
+        case .recording, .paused, .starting: return true
+        case .stopping, .stopped, .failed: return false
         }
     }
     var label: String {
@@ -83,6 +119,7 @@ enum RunState: Equatable {
         case .starting: return "启动中"
         case .recording: return "录制中"
         case .paused: return "已暂停"
+        case .stopping: return "停止中"
         case .failed(let m): return "异常：\(m)"
         }
     }
@@ -92,6 +129,18 @@ struct LogLine: Identifiable {
     let id = UUID()
     let date: Date
     let text: String
+}
+
+/// 杀掉本 app 路径下残留的 ffmpeg（stop 置空引用后、或强杀 app 后的孤儿）
+func killStrayMiCamFFmpeg() {
+    guard let bin = AppPaths.ffmpeg?.path, !bin.isEmpty else { return }
+    let p = Process()
+    p.executableURL = URL(fileURLWithPath: "/usr/bin/pkill")
+    p.arguments = ["-9", "-f", bin]
+    p.standardOutput = FileHandle.nullDevice
+    p.standardError = FileHandle.nullDevice
+    try? p.run()
+    p.waitUntilExit()
 }
 
 // MARK: - 主控
@@ -255,6 +304,7 @@ final class Supervisor: ObservableObject {
     // MARK: 启动 / 停止
 
     func setBlockedByLegacy() { blockedByLegacy = true }
+    func clearBlockedByLegacy() { blockedByLegacy = false }
 
     /// 主动测一次外置盘写入。
     /// 没有 FDA 时这会弹出「可移除卷」授权框——比 FDA 更窄，是最推荐给用户的授权方式。
@@ -367,14 +417,18 @@ final class Supervisor: ObservableObject {
         }
         log("配置已生成：\(yaml.path)")
 
+        // 防止上次强退留下的孤儿 ffmpeg 继续写盘
+        killStrayMiCamFFmpeg()
+
         // 起 go2rtc：优先用已安装的后台助手（root 才有本地网络权限）
         if Go2rtcHelper.isInstalled {
             if Go2rtcHelper.isHelperBinaryStale() {
                 log("注意：后台助手里的 go2rtc 与 app 内置版本不一致（app 升级过）。到「设置 → 高级」点「重装后台组件」可同步。")
             }
             go2rtcMode = "后台助手"
-            log("go2rtc 由后台助手运行，重启以加载最新配置")
-            if Go2rtcHelper.restart() {
+            log("go2rtc 由后台助手运行，拉起以加载最新配置")
+            // stop 时会 bootout；这里用 ensureRunning（bootstrap + kickstart）
+            if Go2rtcHelper.ensureRunning() {
                 var ready = false
                 for _ in 0..<24 {
                     try? await Task.sleep(nanoseconds: 500_000_000)
@@ -383,7 +437,7 @@ final class Supervisor: ObservableObject {
                 log(ready ? "go2rtc API 就绪" : "go2rtc API 未就绪")
                 await checkHelperNetwork()
             } else {
-                log("后台助手重启失败，回退到 app 内置子进程")
+                log("后台助手拉起失败，回退到 app 内置子进程")
                 go2rtcMode = "内置子进程"
             }
             if go2rtcMode == "后台助手" {
@@ -436,9 +490,20 @@ final class Supervisor: ObservableObject {
         paused = true
         recorderTask?.cancel()
         recorderTask = nil
-        ffmpeg?.interrupt()
+        let old = ffmpeg
+        ffmpeg = nil
         state = .paused
-        log("已暂停录制（go2rtc 保持运行，方便预览）")
+        log("正在收尾当前段（写 moov）…")
+        Task {
+            let rc = await old?.stopAndWait(timeout: 15.0)
+            // 仅清真正没退出的孤儿；收尾成功时 pkill 找不到进程
+            if old?.isRunning == true { killStrayMiCamFFmpeg() }
+            await MainActor.run {
+                self.log(rc != nil && old?.isRunning != true
+                         ? "已暂停录制（当前段已收尾，go2rtc 保持运行）"
+                         : "已暂停录制（收尾超时，当前段可能不完整）")
+            }
+        }
     }
 
     func resume() {
@@ -450,22 +515,38 @@ final class Supervisor: ObservableObject {
     }
 
     func stop() async {
+        guard state.canStop else { return }
+        state = .stopping
         stopping = true
         paused = false
         recorderTask?.cancel()
         recorderTask = nil
-        ffmpeg?.interrupt()
-        let old = ffmpeg
+
+        let oldF = ffmpeg
         ffmpeg = nil
-        _ = await old?.wait()
-        go2rtc?.terminate()
-        let g = go2rtc
+        // 给足时间写 moov + faststart；过早 SIGKILL 会留下不可播的最新段
+        log("正在收尾当前录像段…")
+        let rc = await oldF?.stopAndWait(timeout: 15.0)
+        if oldF?.isRunning == true {
+            killStrayMiCamFFmpeg()
+            log("ffmpeg 收尾超时，已强制结束（最新段可能不可播）")
+        } else if oldF != nil {
+            log("当前段已收尾（ffmpeg rc=\(rc ?? 0)）")
+        }
+
+        let oldG = go2rtc
         go2rtc = nil
         go2rtcPID = 0
-        _ = await g?.wait()
+        _ = await oldG?.stopAndWait(timeout: 1.5, escalate: false)
+
         if Go2rtcHelper.isInstalled {
-            log("录制已停止（后台助手保持运行，空闲时不会去连相机）")
+            if Go2rtcHelper.stopDaemon() {
+                log("后台 go2rtc 助手已停止")
+            } else {
+                log("后台 go2rtc 助手未能停止（设置 → 高级 → 重装后台组件，以更新 sudo 白名单）")
+            }
         }
+
         state = .stopped
         startedAt = nil
         currentFile = ""
@@ -482,7 +563,7 @@ final class Supervisor: ObservableObject {
         case .stopped, .failed: await start()
         case .recording: pause()
         case .paused: resume()
-        case .starting: break
+        case .starting, .stopping: break
         }
     }
 
@@ -493,20 +574,32 @@ final class Supervisor: ObservableObject {
         return p
     }
 
-    /// 应用退出时的同步兜底：别把子进程留成孤儿
+    /// 应用退出时的同步兜底：尽量收尾当前段，再强杀，避免孤儿
     func emergencyStop() {
         stopping = true
         paused = false
         recorderTask?.cancel()
-        ffmpeg?.interrupt()
-        go2rtc?.terminate()
-        let deadline = Date().addingTimeInterval(1.5)
+        let oldF = ffmpeg
+        let oldG = go2rtc
+        ffmpeg = nil
+        go2rtc = nil
+        go2rtcPID = 0
+        oldF?.quitGracefully()
+        Thread.sleep(forTimeInterval: 0.3)
+        oldF?.interrupt()
+        oldG?.terminate()
+        // 退出流程不能卡太久，但仍尽量等 moov 写完
+        let deadline = Date().addingTimeInterval(8)
         while Date() < deadline {
-            if ffmpeg?.isRunning != true && go2rtc?.isRunning != true { break }
+            if oldF?.isRunning != true && oldG?.isRunning != true { break }
             Thread.sleep(forTimeInterval: 0.05)
         }
-        ffmpeg?.killForce()
-        go2rtc?.killForce()
+        oldF?.killForce()
+        oldG?.killForce()
+        if oldF?.isRunning == true { killStrayMiCamFFmpeg() }
+        if Go2rtcHelper.isInstalled {
+            _ = Go2rtcHelper.stopDaemon()
+        }
     }
 
     // MARK: 录制循环
@@ -562,7 +655,8 @@ final class Supervisor: ObservableObject {
         let c = config
         let out = c.storage.outDir
         return [
-            "-hide_banner", "-nostdin", "-nostats", "-loglevel", "warning",
+            // 不用 -nostdin：停止时通过 stdin 发 q，让当前段写完 moov 再退出
+            "-hide_banner", "-nostats", "-loglevel", "warning",
             "-rtsp_transport", "tcp",
             "-timeout", String(c.recorder.readTimeoutSec * 1_000_000),
             "-i", "rtsp://127.0.0.1:\(c.rtspPort)/micam2",
@@ -570,9 +664,10 @@ final class Supervisor: ObservableObject {
             "-f", "segment",
             "-segment_time", String(c.recorder.segmentSeconds),
             "-segment_format", "mp4",
+            // segment 不会吃顶层 -movflags；必须经 segment_format_options 传给 mp4 muxer
+            "-segment_format_options", "movflags=+faststart",
             "-reset_timestamps", "1",
             "-strftime", "1",
-            "-movflags", "+faststart",
             "-tag:v", "hvc1",
             "\(out)/%Y%m%d_%H%M%S.mp4",
         ]
@@ -693,7 +788,7 @@ final class Supervisor: ObservableObject {
     private func restartGo2rtc(reason: String) async {
         log("重启 go2rtc（\(reason)）")
         if Go2rtcHelper.isInstalled {
-            if Go2rtcHelper.restart() {
+            if Go2rtcHelper.ensureRunning() {
                 for _ in 0..<24 {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     if await apiGet("/api/streams", timeout: 3) != nil { break }
@@ -706,7 +801,7 @@ final class Supervisor: ObservableObject {
                 }
                 return
             } else {
-                log("后台助手重启失败（sudo 白名单可能没装）")
+                log("后台助手拉起失败（sudo 白名单可能没装或需重装助手）")
             }
         }
         go2rtc?.terminate()

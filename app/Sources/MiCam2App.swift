@@ -26,28 +26,54 @@ struct MiCam2App: App {
         .defaultLaunchBehavior(.presented)
         .commands {
             CommandGroup(replacing: .newItem) {}
-            CommandGroup(after: .appInfo) {
-                Button("打开主窗口") { WindowOpener.open() }
-                    .keyboardShortcut("0")
-            }
+            OpenMainWindowCommands()
         }
     }
 }
 
+/// 关窗后 SwiftUI 会销毁 Window；必须用 openWindow(id:) 重建。
+/// 通知发到 MainWindow 上无效——窗口不存在时没有接收者。
 enum WindowOpener {
+    static let windowID = "main"
+
+    /// 由带 @Environment(\.openWindow) 的视图注册
+    @MainActor static var openWindowAction: ((String) -> Void)?
+
+    @MainActor
     static func open() {
         NSApp.activate(ignoringOtherApps: true)
-        // 关窗后窗口会销毁，这里用 AppleScript 以外的兜底：遍历已有窗口，没有再走 URL 触发
-        if let w = NSApp.windows.first(where: { $0.canBecomeMain && $0.title.contains("MiCam2") }) {
+        if let w = NSApp.windows.first(where: Self.isMainWindow) {
+            w.deminiaturize(nil)
             w.makeKeyAndOrderFront(nil)
-        } else {
-            NotificationCenter.default.post(name: .micam2ShowWindow, object: nil)
+            return
         }
+        openWindowAction?(windowID)
+        // 重建是异步的，稍后再置前
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            NSApp.activate(ignoringOtherApps: true)
+            NSApp.windows.first(where: Self.isMainWindow)?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    static func isMainWindow(_ w: NSWindow) -> Bool {
+        if w.identifier?.rawValue == windowID { return true }
+        if w.title.contains("MiCam2") && w.canBecomeMain { return true }
+        return false
     }
 }
 
-extension Notification.Name {
-    static let micam2ShowWindow = Notification.Name("micam2.showWindow")
+private struct OpenMainWindowCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .appInfo) {
+            Button("打开主窗口") {
+                WindowOpener.openWindowAction = { openWindow(id: $0) }
+                WindowOpener.open()
+            }
+            .keyboardShortcut("0")
+        }
+    }
 }
 
 enum Bootstrap {
@@ -64,12 +90,7 @@ enum Bootstrap {
         }
         Task { @MainActor in
             let sup = Supervisor.shared
-            // 不自动开始时不去碰外置盘：否则会弹出「可移除卷」授权框，
-            // 而挂起的授权框会让别的进程（旧录制）也写不进去。
-            if CommandLine.arguments.contains("--no-autostart") {
-                sup.log("界面已打开（未自动开始）。授权后点「开始」。")
-                return
-            }
+            // 启动不自动开录，避免一打开就碰外置盘弹授权框、也避免用户未点开始就写盘。
             if CommandLine.arguments.contains("--testwrite") {
                 await sup.testVolumeWrite()
                 sup.log("TESTWRITE 汇总 可写=\(sup.volumeOK)")
@@ -83,11 +104,12 @@ enum Bootstrap {
                 exit(0)
             }
             if Legacy.scan().kitIsRunning && !CommandLine.arguments.contains("--force-start") {
-                sup.log("旧服务还在录制：先点「一键接管」把它们卸掉，再让 MiCam2 开录")
+                sup.log("旧服务还在录制：先点「一键接管」把它们卸掉，再点「开始」开录")
                 sup.setBlockedByLegacy()
                 return
             }
-            sup.log("界面启动完成，权限自检：\(await sup.permissionCheckAsync() ?? "通过")")
+            let perm = await sup.permissionCheckAsync()
+            sup.log("界面已就绪（未自动开录）。权限：\(perm ?? "通过")。点「开始」开始录像。")
             if sup.config.launchAtLogin && !LoginItem.isEnabled {
                 LoginItem.install()
                 sup.log("已设置开机自启")
@@ -101,9 +123,7 @@ enum Bootstrap {
                 await sup.runSelfTest()
                 return
             }
-            if sup.config.camera.isConfigured {
-                await sup.start()
-            } else {
+            if !sup.config.camera.isConfigured {
                 sup.log("还没有配置相机，请到「设置 → 相机」填写或点「导入旧配置」")
             }
         }
@@ -123,6 +143,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag {
+            Task { @MainActor in WindowOpener.open() }
+        }
+        return true
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         Supervisor.shared.emergencyStop()
     }
@@ -132,12 +159,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 struct MenuContent: View {
     @ObservedObject var supervisor: Supervisor
+    @Environment(\.openWindow) private var openWindow
 
     static func icon(for state: RunState) -> String {
         switch state {
         case .recording: return "record.circle.fill"
         case .paused: return "pause.circle.fill"
-        case .starting: return "arrow.triangle.2.circlepath"
+        case .starting, .stopping: return "arrow.triangle.2.circlepath"
         case .stopped: return "stop.circle"
         case .failed: return "exclamationmark.triangle.fill"
         }
@@ -149,7 +177,14 @@ struct MenuContent: View {
             .font(.caption)
             .foregroundStyle(.secondary)
         Divider()
-        Button("打开主窗口") { windowFront() }
+        Button("打开主窗口") {
+            WindowOpener.openWindowAction = { openWindow(id: $0) }
+            openWindow(id: WindowOpener.windowID)
+            NSApp.activate(ignoringOtherApps: true)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                NSApp.windows.first(where: WindowOpener.isMainWindow)?.makeKeyAndOrderFront(nil)
+            }
+        }
         Button("打开录像目录") {
             NSWorkspace.shared.open(URL(fileURLWithPath: supervisor.config.storage.outDir))
         }
@@ -157,10 +192,11 @@ struct MenuContent: View {
         Button(supervisor.state == .recording ? "暂停录制" : "开始录制") {
             Task { await supervisor.toggle() }
         }
-        Button("停止") {
+        .disabled(supervisor.state == .starting || supervisor.state == .stopping)
+        Button(supervisor.state == .stopping ? "停止中…" : "停止") {
             Task { await supervisor.stop() }
         }
-        .disabled(!supervisor.state.isActive)
+        .disabled(!supervisor.state.canStop)
         Divider()
         Button("退出 MiCam2") {
             Task {
@@ -168,13 +204,7 @@ struct MenuContent: View {
                 NSApp.terminate(nil)
             }
         }
-    }
-
-    private func windowFront() {
-        WindowOpener.open()
-        for w in NSApp.windows where w.canBecomeMain {
-            w.makeKeyAndOrderFront(nil)
-        }
+        .disabled(supervisor.state == .stopping)
     }
 }
 
@@ -198,6 +228,7 @@ enum MainTab: String, CaseIterable, Identifiable {
 
 struct MainWindow: View {
     @ObservedObject var supervisor: Supervisor
+    @Environment(\.openWindow) private var openWindow
     @State private var tab: MainTab = .status
 
     var body: some View {
@@ -242,8 +273,9 @@ struct MainWindow: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 860, minHeight: 560)
-        .onReceive(NotificationCenter.default.publisher(for: .micam2ShowWindow)) { _ in
-            for w in NSApp.windows where w.canBecomeMain { w.makeKeyAndOrderFront(nil) }
+        .onAppear {
+            // 关窗前把 openWindow 挂上，Dock 点击 / 菜单也能重建窗口
+            WindowOpener.openWindowAction = { openWindow(id: $0) }
         }
     }
 }
@@ -254,7 +286,7 @@ struct StatusDot: View {
         switch state {
         case .recording: return .green
         case .paused: return .orange
-        case .starting: return .yellow
+        case .starting, .stopping: return .yellow
         case .stopped: return .gray
         case .failed: return .red
         }
@@ -292,14 +324,15 @@ struct StatusPane: View {
                     banner("本地网络权限没授予：go2rtc 连不上局域网里的相机（报 i/o timeout）。去「系统设置 → 隐私与安全性 → 本地网络」勾选 MiCam2，然后点“重新检测”。",
                            kind: .error, pane: "Privacy_LocalNetwork")
                 }
-                if supervisor.blockedByLegacy {
+                // 只提示真正冲突的旧服务；App 自己的 go2rtc 助手 / 开机项不算
+                if supervisor.blockedByLegacy
+                    || legacy.kitIsRunning
+                    || !legacy.daemons.isEmpty
+                    || !legacy.agents.isEmpty {
                     legacyBanner
                 }
                 if !Go2rtcHelper.isInstalled {
                     helperBanner
-                }
-                if legacy.kitIsRunning && !legacy.daemons.isEmpty {
-                    legacyBanner
                 }
                 HStack(alignment: .top, spacing: 16) {
                     previewCard
@@ -349,15 +382,19 @@ struct StatusPane: View {
                         .frame(minWidth: 64)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(supervisor.state == .starting)
+                .disabled(supervisor.state == .starting || supervisor.state == .stopping)
 
                 Button {
                     Task { await supervisor.stop() }
                 } label: {
-                    Label("停止", systemImage: "stop.fill")
+                    Label(supervisor.state == .stopping ? "停止中…" : "停止",
+                          systemImage: supervisor.state == .stopping
+                            ? "arrow.triangle.2.circlepath"
+                            : "stop.fill")
+                        .frame(minWidth: 72)
                 }
                 .buttonStyle(.bordered)
-                .disabled(!supervisor.state.isActive)
+                .disabled(!supervisor.state.canStop)
             }
         }
     }
@@ -496,13 +533,7 @@ struct StatusPane: View {
                 supervisor.log("开始安装后台助手…")
                 let yaml = (try? ConfigStore.shared.writeGo2rtcYAML()) ?? AppPaths.yamlFile
                 Go2rtcHelper.install(yamlPath: yaml.path) { ok, out in
-                    supervisor.log(ok ? "后台助手安装成功" : "后台助手安装失败：\(out)")
-                    Task { @MainActor in
-                        if ok {
-                            try? await Task.sleep(nanoseconds: 3_000_000_000)
-                            await supervisor.start()
-                        }
-                    }
+                    supervisor.log(ok ? "后台助手安装成功，点「开始」开录" : "后台助手安装失败：\(out)")
                 }
             }
             .buttonStyle(.borderedProminent)
@@ -528,13 +559,9 @@ struct StatusPane: View {
                 supervisor.log("开始接管：卸载旧服务…")
                 Legacy.uninstall { ok, out in
                     if ok {
-                        supervisor.log("旧服务已卸载")
+                        supervisor.log("旧服务已卸载，点「开始」开录")
                         legacy = Legacy.scan()
-                        Task { @MainActor in
-                            try? await Task.sleep(nanoseconds: 2_000_000_000)
-                            await supervisor.start()
-                            legacy = Legacy.scan()
-                        }
+                        supervisor.clearBlockedByLegacy()
                     } else {
                         supervisor.log("卸载旧服务失败：\(out)")
                     }
@@ -585,7 +612,8 @@ struct StatusPane: View {
             .buttonStyle(.bordered)
             Button("重新检测") {
                 Task { @MainActor in
-                    if await supervisor.recheckPermissions() == nil { await supervisor.start() }
+                    let p = await supervisor.recheckPermissions()
+                    supervisor.log(p == nil ? "权限已通过，点「开始」开录" : "仍有问题：\(p!)")
                 }
             }
             .buttonStyle(.borderedProminent)

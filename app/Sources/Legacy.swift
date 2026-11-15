@@ -21,22 +21,66 @@ struct LegacyState {
 }
 
 enum Legacy {
-    static let daemonLabels = ["com.micam2.go2rtc", "com.micam2.watchdog"]
+    /// 旧方案专属；不含 App 自己的 go2rtc 助手 / 开机自启
+    static let watchdogLabel = "com.micam2.watchdog"
     static let agentLabels = ["com.micam2.recorder", "com.micam2.prune"]
+    static let go2rtcLabel = "com.micam2.go2rtc"
+    /// App 新助手二进制路径（同 label 的旧方案指向 ~/micam2/bin/go2rtc）
+    static let newHelperBinary = "/Library/Application Support/MiCam2/go2rtc"
+    static let loginItemLabel = "com.micam2.app"
+
+    /// 当前 system 里的 com.micam2.go2rtc 是否是 App 安装的新助手（不是旧 kit）
+    static func isNewGo2rtcHelperPlist(_ path: String) -> Bool {
+        guard let xml = try? String(contentsOfFile: path, encoding: .utf8) else { return false }
+        return xml.contains(newHelperBinary)
+            || xml.contains("/Library/Application Support/MiCam2/")
+    }
 
     static func scan() -> LegacyState {
         var s = LegacyState()
         let dm = FileManager.default
-        for label in daemonLabels where dm.fileExists(atPath: "/Library/LaunchDaemons/\(label).plist") {
-            s.daemons.append(label)
+        let home = NSHomeDirectory()
+
+        // 旧 watchdog 守护进程
+        let wdPlist = "/Library/LaunchDaemons/\(watchdogLabel).plist"
+        if dm.fileExists(atPath: wdPlist) { s.daemons.append(watchdogLabel) }
+
+        // go2rtc：同名 label 可能是新助手，不能当旧方案
+        let g2Daemon = "/Library/LaunchDaemons/\(go2rtcLabel).plist"
+        if dm.fileExists(atPath: g2Daemon), !isNewGo2rtcHelperPlist(g2Daemon) {
+            s.daemons.append(go2rtcLabel)
         }
-        for label in agentLabels where dm.fileExists(atPath: NSHomeDirectory() + "/Library/LaunchAgents/\(label).plist") {
-            s.agents.append(label)
+        let g2Agent = home + "/Library/LaunchAgents/\(go2rtcLabel).plist"
+        if dm.fileExists(atPath: g2Agent) {
+            s.agents.append(go2rtcLabel)
         }
-        let kit = NSHomeDirectory() + "/micam2"
+
+        for label in agentLabels {
+            let p = home + "/Library/LaunchAgents/\(label).plist"
+            if dm.fileExists(atPath: p) { s.agents.append(label) }
+        }
+
+        let kit = home + "/micam2"
         s.kitExists = dm.fileExists(atPath: kit)
-        if let out = runSync("/bin/launchctl", ["list"]), out.contains("com.micam2.") {
-            s.kitIsRunning = true
+
+        // 只有真正冲突的旧录制相关服务才算「还在跑」
+        // 不要用 contains("com.micam2.")：会命中新助手和开机项 com.micam2.app
+        let conflictLabels: [String] = {
+            var xs = agentLabels + [watchdogLabel]
+            if s.daemons.contains(go2rtcLabel) || s.agents.contains(go2rtcLabel) {
+                xs.append(go2rtcLabel)
+            }
+            return xs
+        }()
+        if let out = runSync("/bin/launchctl", ["list"]) {
+            s.kitIsRunning = conflictLabels.contains { out.contains($0) }
+        }
+        // 旧 kit 路径下的 ffmpeg/go2rtc 进程也算冲突
+        if !s.kitIsRunning, let ps = runSync("/bin/ps", ["-Ao", "command"]) {
+            let marker = home + "/micam2/bin/"
+            s.kitIsRunning = ps.split(separator: "\n").contains {
+                $0.contains(marker + "ffmpeg") || $0.contains(marker + "go2rtc")
+            }
         }
         return s
     }
@@ -126,20 +170,32 @@ enum Legacy {
         return found ? cfg : nil
     }
 
-    /// 卸载旧 launchd 服务（需要管理员密码，会弹系统授权框）
+    /// 卸载旧 launchd 服务（需要管理员密码，会弹系统授权框）。
+    /// 不会动 App 自己的 go2rtc 助手（/Library/Application Support/MiCam2/go2rtc）和开机项。
     static func uninstall(completion: @escaping (Bool, String) -> Void) {
+        let home = NSHomeDirectory()
+        let uid = getuid()
         var cmds: [String] = []
-        for label in daemonLabels {
-            cmds.append("launchctl bootout system/\(label) 2>/dev/null || true")
-            cmds.append("rm -f /Library/LaunchDaemons/\(label).plist")
+
+        cmds.append("launchctl bootout system/\(watchdogLabel) 2>/dev/null || true")
+        cmds.append("rm -f /Library/LaunchDaemons/\(watchdogLabel).plist")
+
+        // 仅当 system 里的 go2rtc 不是新助手时才卸
+        let g2Daemon = "/Library/LaunchDaemons/\(go2rtcLabel).plist"
+        cmds.append("""
+        if [ -f '\(g2Daemon)' ] && ! grep -q 'Application Support/MiCam2' '\(g2Daemon)' 2>/dev/null; then
+          launchctl bootout system/\(go2rtcLabel) 2>/dev/null || true
+          rm -f '\(g2Daemon)'
+        fi
+        """)
+
+        for label in ([go2rtcLabel] + agentLabels) {
+            cmds.append("launchctl bootout gui/\(uid)/\(label) 2>/dev/null || true")
+            cmds.append("rm -f '\(home)/Library/LaunchAgents/\(label).plist'")
         }
-        for label in agentLabels {
-            cmds.append("launchctl bootout gui/$(id -u suke)/\(label) 2>/dev/null || true")
-            cmds.append("rm -f \(NSHomeDirectory())/Library/LaunchAgents/\(label).plist")
-        }
-        // 停掉还在跑的旧进程
-        cmds.append("pkill -f '\(NSHomeDirectory())/micam2/bin/go2rtc' 2>/dev/null || true")
-        cmds.append("pkill -f '\(NSHomeDirectory())/micam2/bin/ffmpeg' 2>/dev/null || true")
+        // 停掉还在跑的旧进程（只动 ~/micam2/bin，不动新助手）
+        cmds.append("pkill -f '\(home)/micam2/bin/go2rtc' 2>/dev/null || true")
+        cmds.append("pkill -f '\(home)/micam2/bin/ffmpeg' 2>/dev/null || true")
         let script = cmds.joined(separator: "; ")
         runAdmin(script, completion: completion)
     }

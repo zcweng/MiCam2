@@ -275,24 +275,17 @@ enum RecordingStore {
         return out.sorted { $0.modified > $1.modified }
     }
 
-    /// 没有 moov 的 mp4（断电/被杀留下的半截段）不可播：
-    /// faststart 会把 moov 放在文件头部，所以只查头部 2MB 就够。
-    static func isPlayable(_ url: URL) -> Bool {
-        guard let h = try? FileHandle(forReadingFrom: url) else { return false }
-        defer { try? h.close() }
-        let head = (try? h.read(upToCount: 2 * 1024 * 1024)) ?? Data()
-        guard head.count > 64 else { return false }
-        return head.range(of: Data("moov".utf8)) != nil
-    }
-
+    /// 与 `df` / prune.sh 同一口径。不要用 ImportantUsage：外置盘上常低估甚至为 0，会触发按最旧狂删。
     static func freeGB(_ dir: String) -> Double? {
-        let url = URL(fileURLWithPath: dir)
-        guard let v = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
-              let bytes = v.volumeAvailableCapacityForImportantUsage else { return nil }
-        return Double(bytes) / 1_000_000_000
+        if let vals = try? FileManager.default.attributesOfFileSystem(forPath: dir),
+           let free = vals[.systemFreeSize] as? NSNumber {
+            return free.doubleValue / 1_000_000_000
+        }
+        return nil
     }
 
-    /// 返回 (删除数量, 释放字节)
+    /// 返回 (删除数量, 释放字节)。
+    /// 不按可播性删半截段：空壳/半截段也保留，只按天数与剩余空间清理。
     @discardableResult
     static func prune(_ cfg: StorageConfig) -> (Int, Int64) {
         let fm = FileManager.default
@@ -300,8 +293,9 @@ enum RecordingStore {
         guard !all.isEmpty else { return (0, 0) }
         // 只保护“刚写过的文件”（15 分钟内），而不是机械地保护最新 N 个，
         // 否则目录里文件很少时，一个几年前的坏文件会被当成“最新”永远不动。
+        let protectN = max(cfg.protectNewest, 0)
         var protected = all.filter { Date().timeIntervalSince($0.modified) < 900 }
-        protected += all.prefix(max(cfg.protectNewest, 0))
+        protected += all.prefix(protectN)
         let newest = Set(protected.map { $0.url.path })
         var removed = 0
         var freed: Int64 = 0
@@ -313,14 +307,7 @@ enum RecordingStore {
             }
         }
 
-        // 1) 半截段（不可播）立刻清掉，但不动正在写的那个
-        for r in all where !newest.contains(r.url.path) {
-            if Date().timeIntervalSince(r.modified) > 600 && !isPlayable(r.url) {
-                drop(r)
-            }
-        }
-
-        // 2) 超过保留天数
+        // 1) 超过保留天数
         var rest = list(cfg.outDir).filter { !newest.contains($0.url.path) }
         if cfg.keepDays > 0 {
             let cutoff = Date().addingTimeInterval(-Double(cfg.keepDays) * 86400)
@@ -328,10 +315,12 @@ enum RecordingStore {
             rest = list(cfg.outDir).filter { !newest.contains($0.url.path) }
         }
 
-        // 3) 剩余空间兜底：从最旧的删
+        // 2) 剩余空间兜底：从最旧的删，始终保留最近 protectNewest 个
         if let free = freeGB(cfg.outDir), free < Double(cfg.minFreeGB) {
             for r in rest.reversed() {
                 guard let f = freeGB(cfg.outDir), f < Double(cfg.minFreeGB) else { break }
+                let left = list(cfg.outDir).count
+                if left <= protectN { break }
                 drop(r)
             }
         }

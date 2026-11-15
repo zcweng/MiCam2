@@ -32,27 +32,7 @@ if ! ls "$OUT_DIR" >/dev/null 2>&1; then
   exit 1
 fi
 
-# 0) 清理残留的空壳段（进程被杀时留下的、没有 moov 的几十字节文件）
-#    条件同时满足才删：<100KB 且 15 分钟没动过，所以不会碰到正在写的那一段
-stub=$(find "$OUT_DIR" -maxdepth 1 -type f -name '*.mp4' -size -100k -mmin +15 -print -delete 2>/dev/null | wc -l | tr -d ' ')
-[ "$stub" -gt 0 ] && log "清理空壳段 $stub 个"
-
-# 0b) 清理"半截段"：断电/被 kill 的那一刻正在写的那一段，moov 没写回 → 完全不可播，
-#     但体积可能有几 MB（空壳规则管不到）。用 ffprobe 试读，读不了且 10 分钟没动就删。
-#     只查最近 2 天动过的文件，控制耗时（一小时跑一次，几十到几百个文件）。
-FFPROBE="${FFPROBE:-$(command -v ffprobe || echo /usr/local/bin/ffprobe)}"
-if [ -x "$FFPROBE" ]; then
-  broken=0
-  newest=$(ls -t "$OUT_DIR"/*.mp4 2>/dev/null | head -1)   # 正在写的那一段永远不碰
-  while IFS= read -r f; do
-    [ -n "$f" ] || continue
-    [ "$f" = "$newest" ] && continue
-    if ! "$FFPROBE" -v error -show_entries format=duration -of csv=p=0 "$f" >/dev/null 2>&1; then
-      rm -f -- "$f" && broken=$((broken + 1))
-    fi
-  done < <(find "$OUT_DIR" -maxdepth 1 -type f -name '*.mp4' -mmin +10 -mtime -2 2>/dev/null)
-  [ "$broken" -gt 0 ] && log "清理不可播的半截段 $broken 个"
-fi
+# 不按可播性删半截段/空壳段：一律保留，只按天数与剩余空间清理。
 
 # 1) 按天数清理
 if [ "$KEEP_DAYS" -gt 0 ]; then

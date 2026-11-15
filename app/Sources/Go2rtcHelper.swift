@@ -73,7 +73,7 @@ enum Go2rtcHelper {
         /bin/echo \(plistEscaped) > '\(daemonPlist)'
         /usr/sbin/chown root:wheel '\(daemonPlist)'
         /bin/chmod 644 '\(daemonPlist)'
-        /bin/echo '\(user) ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/\(label)' > '\(sudoersPath)'
+        /bin/echo '\(user) ALL=(root) NOPASSWD: /bin/launchctl kickstart -k system/\(label), /bin/launchctl bootout system/\(label), /bin/launchctl bootstrap system \(daemonPlist)' > '\(sudoersPath)'
         /bin/chmod 440 '\(sudoersPath)'
         /usr/sbin/visudo -cf '\(sudoersPath)' >/dev/null
         /bin/launchctl bootout system/\(label) 2>/dev/null || true
@@ -87,6 +87,36 @@ enum Go2rtcHelper {
     static func restart() -> Bool {
         let (code, _) = runWithTimeout("/usr/bin/sudo", ["-n", "/bin/launchctl", "kickstart", "-k", "system/\(label)"], timeout: 30)
         return code == 0
+    }
+
+    /// 确保助手在跑：已加载则 kickstart；被 bootout 过则 bootstrap 再拉起。
+    @discardableResult
+    static func ensureRunning() -> Bool {
+        if isRunning { return restart() }
+        let (boot, _) = runWithTimeout(
+            "/usr/bin/sudo",
+            ["-n", "/bin/launchctl", "bootstrap", "system", daemonPlist],
+            timeout: 30
+        )
+        if boot != 0 && !isRunning {
+            // 可能已加载但进程刚挂：再试 kickstart
+            return restart()
+        }
+        if isRunning { return true }
+        return restart()
+    }
+
+    /// 停止助手（NOPASSWD bootout）。旧版 sudoers 只有 kickstart 时会失败，需重装助手。
+    @discardableResult
+    static func stopDaemon() -> Bool {
+        let (code, _) = runWithTimeout(
+            "/usr/bin/sudo",
+            ["-n", "/bin/launchctl", "bootout", "system/\(label)"],
+            timeout: 15
+        )
+        let deadline = Date().addingTimeInterval(3)
+        while isRunning && Date() < deadline { usleep(100_000) }
+        return code == 0 || !isRunning
     }
 
     /// 彻底停止后台服务（需要管理员密码）

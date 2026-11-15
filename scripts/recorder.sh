@@ -64,8 +64,9 @@ while :; do
     -i "$RTSP_URL" \
     -map 0:v:0 -map 0:a:0? -c copy \
     -f segment -segment_time "$SEGMENT_SECONDS" -segment_format mp4 \
+    -segment_format_options movflags=+faststart \
     -reset_timestamps 1 -strftime 1 \
-    -movflags +faststart -tag:v hvc1 \
+    -tag:v hvc1 \
     "$OUT_DIR/%Y%m%d_%H%M%S.mp4"
   rc=$?
   dur=$(( $(date +%s) - t0 ))
