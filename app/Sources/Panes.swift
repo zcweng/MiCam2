@@ -80,6 +80,48 @@ struct SettingsPane: View {
                             Text("秒").font(.caption).foregroundStyle(.secondary)
                         }
                     }
+                    row("静止稀疏") {
+                        Toggle("画面静止时降帧写入（运动仍原流 copy）", isOn: $draft.recorder.idleSparseEnabled)
+                    }
+                    if draft.recorder.idleSparseEnabled {
+                        row("静止帧间隔") {
+                            HStack {
+                                TextField("", value: $draft.recorder.idleFrameIntervalSec, format: .number)
+                                    .frame(width: 70).textFieldStyle(.roundedBorder)
+                                Text("秒/帧（越大越省盘）").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        row("静止码率") {
+                            HStack {
+                                TextField("", text: $draft.recorder.idleVideoBitrate)
+                                    .frame(width: 90).textFieldStyle(.roundedBorder)
+                                Text("如 200k").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        row("进静止") {
+                            HStack {
+                                TextField("", value: $draft.recorder.idleEnterAfterSec, format: .number)
+                                    .frame(width: 70).textFieldStyle(.roundedBorder)
+                                Text("秒无动作后期望切静止（段边界才真正切换）")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        row("回运动") {
+                            HStack {
+                                TextField("", value: $draft.recorder.motionExitAfterSec, format: .number)
+                                    .frame(width: 70).textFieldStyle(.roundedBorder)
+                                Text("秒有动作后期望切运动").font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                        row("灵敏度") {
+                            HStack {
+                                TextField("", value: $draft.recorder.motionThreshold, format: .number)
+                                    .frame(width: 70).textFieldStyle(.roundedBorder)
+                                Text("差分阈值，越小越敏感（默认 0.04）")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
                 }
 
                 section("自愈看门狗") {

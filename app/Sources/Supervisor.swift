@@ -29,6 +29,19 @@ final class ChildProcess {
         }
     }
 
+    deinit {
+        // NSTask/Process 在仍运行时 dealloc 会抛异常导致 SIGABRT；释放前必须先杀掉
+        pipe.fileHandleForReading.readabilityHandler = nil
+        proc.terminationHandler = nil
+        if proc.isRunning {
+            kill(proc.processIdentifier, SIGKILL)
+            let deadline = Date().addingTimeInterval(1.0)
+            while proc.isRunning && Date() < deadline {
+                usleep(10_000)
+            }
+        }
+    }
+
     private func consume(_ d: Data) {
         buffer.append(d)
         while let idx = buffer.firstIndex(of: 0x0A) {
@@ -68,31 +81,69 @@ final class ChildProcess {
                 terminate()
             }
         }
-        let result = await wait(timeout: timeout)
+        _ = await wait(timeout: timeout)
         if isRunning { killForce() }
-        return isRunning ? await wait(timeout: 0.5) : result
+        if isRunning {
+            _ = await wait(timeout: 0.5)
+        }
+        return isRunning ? -1 : proc.terminationStatus
     }
 
-    func wait(timeout: TimeInterval = 3600) async -> Int32 {
+    /// 等到进程真正退出。录制循环用这个——不会在仍运行时返回。
+    func wait() async -> Int32 {
+        await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
+            finishWhenExited(cont)
+        }
+    }
+
+    /// 限时等待。超时后进程可能仍在跑：调用方必须继续持有本对象并自行 stop/kill，不可立刻释放。
+    func wait(timeout: TimeInterval) async -> Int32 {
         await withCheckedContinuation { (cont: CheckedContinuation<Int32, Never>) in
             let lock = NSLock()
             var done = false
-            func finish(_ c: Int32) {
+            let finish: @Sendable (Int32) -> Void = { c in
                 lock.lock(); defer { lock.unlock() }
                 if done { return }
                 done = true
                 cont.resume(returning: c)
             }
+            if !proc.isRunning {
+                finish(proc.terminationStatus)
+                return
+            }
             proc.terminationHandler = { p in finish(p.terminationStatus) }
-            DispatchQueue.global().async {
+            DispatchQueue.global().async { [proc] in
                 let deadline = Date().addingTimeInterval(timeout)
-                while self.proc.isRunning && Date() < deadline { usleep(50_000) }
-                finish(self.proc.terminationStatus)
+                while proc.isRunning && Date() < deadline { usleep(50_000) }
+                if proc.isRunning {
+                    finish(-1) // 仍在跑：不要读 terminationStatus 冒充已退出
+                } else {
+                    finish(proc.terminationStatus)
+                }
             }
         }
     }
 
-    func wait() async -> Int32 { await wait(timeout: 3600) }
+    private func finishWhenExited(_ cont: CheckedContinuation<Int32, Never>) {
+        let lock = NSLock()
+        var done = false
+        let finish: @Sendable (Int32) -> Void = { c in
+            lock.lock(); defer { lock.unlock() }
+            if done { return }
+            done = true
+            cont.resume(returning: c)
+        }
+        if !proc.isRunning {
+            finish(proc.terminationStatus)
+            return
+        }
+        proc.terminationHandler = { p in finish(p.terminationStatus) }
+        // 兜底轮询：避免 terminationHandler 在已退出竞态下漏掉
+        DispatchQueue.global().async { [proc] in
+            while proc.isRunning { usleep(100_000) }
+            finish(proc.terminationStatus)
+        }
+    }
 }
 
 // MARK: - 运行状态
@@ -177,6 +228,11 @@ final class Supervisor: ObservableObject {
     @Published private(set) var blockedByLegacy = false
     /// 外置盘是否真的可写（FDA 或用户点过「可移除卷」弹窗的允许，都算）
     @Published private(set) var volumeOK = Supervisor.hasFullDiskAccess()
+    /// 当前 ffmpeg 实际录制模式
+    @Published private(set) var actualRecordMode: RecordMode = .motion
+    /// 动静检测期望模式（段边界才切到 actual）
+    @Published private(set) var desiredRecordMode: RecordMode = .motion
+    @Published private(set) var motionScore: Double = 0
 
     private var go2rtc: ChildProcess?
     private var ffmpeg: ChildProcess?
@@ -189,6 +245,12 @@ final class Supervisor: ObservableObject {
     private var paused = false
     private var frameFailStreak = 0
     private var lastStatsAt = Date()
+    private let motionDetector = MotionDetector()
+    /// 本轮 ffmpeg 启动时间，用于段边界对齐切模式
+    private var modeAnchor = Date()
+    /// 因期望模式变化而主动停 ffmpeg（不计失败 streak）
+    private var switchingForMode = false
+    private var idleEncoder: String?
 
     private init() {
         log("MiCam2 启动，配置目录 \(AppPaths.supportDir.path)")
@@ -420,6 +482,12 @@ final class Supervisor: ObservableObject {
         // 防止上次强退留下的孤儿 ffmpeg 继续写盘
         killStrayMiCamFFmpeg()
 
+        motionDetector.reset(to: .motion)
+        desiredRecordMode = .motion
+        actualRecordMode = .motion
+        motionScore = 0
+        switchingForMode = false
+
         // 起 go2rtc：优先用已安装的后台助手（root 才有本地网络权限）
         if Go2rtcHelper.isInstalled {
             if Go2rtcHelper.isHelperBinaryStale() {
@@ -617,7 +685,19 @@ final class Supervisor: ObservableObject {
         var streak = 0
         while !Task.isCancelled && !stopping && !paused && gen == loopGeneration {
             guard let bin = AppPaths.ffmpeg else { log("找不到 ffmpeg"); return }
-            let args = ffmpegArgs()
+            let mode: RecordMode = {
+                if !config.recorder.idleSparseEnabled { return .motion }
+                return desiredRecordMode
+            }()
+            actualRecordMode = mode
+            switchingForMode = false
+            modeAnchor = Date()
+            let args = ffmpegArgs(mode: mode)
+            if mode == .idle {
+                log("录制模式：静止稀疏（\(config.recorder.idleFrameIntervalSec)s/帧，\(config.recorder.idleVideoBitrate)，编码器 \(resolvedIdleEncoder())）")
+            } else {
+                log("录制模式：运动原流（-c copy）")
+            }
             let f = ChildProcess(label: "ffmpeg", exec: bin, args: args) { [weak self] line in
                 Task { @MainActor in self?.log("[ffmpeg] \(line)") }
             }
@@ -637,7 +717,14 @@ final class Supervisor: ObservableObject {
                 break
             }
 
+            let wasModeSwitch = switchingForMode
+            switchingForMode = false
             let dur = Date().timeIntervalSince(launchedAt)
+            if wasModeSwitch {
+                streak = 0
+                log("段边界切换录制模式（上一轮坚持 \(Int(dur))s，rc=\(rc)）")
+                continue
+            }
             if dur >= 60 { streak = 0 } else { streak += 1 }
             var delay = config.recorder.restartDelay
             var i = 0
@@ -651,16 +738,36 @@ final class Supervisor: ObservableObject {
         }
     }
 
-    private func ffmpegArgs() -> [String] {
+    private func ffmpegArgs(mode: RecordMode) -> [String] {
         let c = config
         let out = c.storage.outDir
-        return [
+        var args: [String] = [
             // 不用 -nostdin：停止时通过 stdin 发 q，让当前段写完 moov 再退出
             "-hide_banner", "-nostats", "-loglevel", "warning",
             "-rtsp_transport", "tcp",
             "-timeout", String(c.recorder.readTimeoutSec * 1_000_000),
             "-i", "rtsp://127.0.0.1:\(c.rtspPort)/micam2",
-            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        ]
+        let vtag: String
+        switch mode {
+        case .motion:
+            args += ["-map", "0:v:0", "-map", "0:a:0?", "-c", "copy"]
+            vtag = "hvc1"
+        case .idle:
+            let interval = max(c.recorder.idleFrameIntervalSec, 0.5)
+            let fps = 1.0 / interval
+            let enc = resolvedIdleEncoder()
+            let br = c.recorder.idleVideoBitrate.isEmpty ? "200k" : c.recorder.idleVideoBitrate
+            args += [
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-vf", String(format: "fps=%.6f", fps),
+                "-c:v", enc, "-b:v", br,
+                "-c:a", "aac", "-b:a", "32k",
+            ]
+            vtag = enc.contains("264") ? "avc1" : "hvc1"
+        }
+        args += [
+            "-tag:v", vtag,
             "-f", "segment",
             "-segment_time", String(c.recorder.segmentSeconds),
             "-segment_format", "mp4",
@@ -668,9 +775,55 @@ final class Supervisor: ObservableObject {
             "-segment_format_options", "movflags=+faststart",
             "-reset_timestamps", "1",
             "-strftime", "1",
-            "-tag:v", "hvc1",
             "\(out)/%Y%m%d_%H%M%S.mp4",
         ]
+        return args
+    }
+
+    /// 探测一次并缓存静止模式编码器：VT HEVC → libx265 → libx264
+    private func resolvedIdleEncoder() -> String {
+        if let idleEncoder { return idleEncoder }
+        let enc = probeIdleEncoder()
+        idleEncoder = enc
+        return enc
+    }
+
+    private func probeIdleEncoder() -> String {
+        guard let bin = AppPaths.ffmpeg else { return "libx264" }
+        let p = Process()
+        p.executableURL = bin
+        p.arguments = ["-hide_banner", "-encoders"]
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice
+        guard (try? p.run()) != nil else { return "libx264" }
+        p.waitUntilExit()
+        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        for name in ["hevc_videotoolbox", "libx265", "h264_videotoolbox", "libx264"] {
+            if out.contains(name) { return name }
+        }
+        return "libx264"
+    }
+
+    /// 期望模式与实际不一致时，等到段边界再优雅停 ffmpeg，由 recorderLoop 用新模式拉起
+    private func maybeSwitchModeAtSegmentBoundary() {
+        guard state == .recording, config.recorder.idleSparseEnabled else { return }
+        guard desiredRecordMode != actualRecordMode else { return }
+        guard ffmpeg?.isRunning == true, !switchingForMode else { return }
+        let seg = TimeInterval(max(config.recorder.segmentSeconds, 10))
+        let elapsed = Date().timeIntervalSince(modeAnchor)
+        // 至少完整跑过一段，且落在虚拟段尾（与 segment_time 对齐），避免一改期望就立刻切出碎文件
+        guard elapsed >= seg else { return }
+        let into = elapsed.truncatingRemainder(dividingBy: seg)
+        guard into >= seg - 2.5 else { return }
+        switchingForMode = true
+        log("期望模式=\(desiredRecordMode.label)，段边界到，切换中…")
+        ffmpeg?.quitGracefully()
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 800_000_000)
+            guard let self, self.switchingForMode, self.ffmpeg?.isRunning == true else { return }
+            self.ffmpeg?.interrupt()
+        }
     }
 
     // MARK: 定时器
@@ -679,7 +832,10 @@ final class Supervisor: ObservableObject {
         stopTimers()
 
         statsTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refreshStats() }
+            Task { @MainActor in
+                self?.refreshStats()
+                self?.maybeSwitchModeAtSegmentBoundary()
+            }
         }
         previewTimer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refreshPreview() }
@@ -747,6 +903,16 @@ final class Supervisor: ObservableObject {
                 networkProblem = false
                 log("本地网络已通，画面恢复")
             }
+            if state == .recording || state == .paused {
+                motionDetector.ingest(img, config: config.recorder)
+                motionScore = motionDetector.lastScore
+                let next = config.recorder.idleSparseEnabled ? motionDetector.desiredMode : .motion
+                if next != desiredRecordMode {
+                    desiredRecordMode = next
+                    log("动静检测：期望 \(next.label)（score=\(String(format: "%.4f", motionScore))）")
+                }
+                maybeSwitchModeAtSegmentBoundary()
+            }
         }
     }
 
@@ -804,10 +970,10 @@ final class Supervisor: ObservableObject {
                 log("后台助手拉起失败（sudo 白名单可能没装或需重装助手）")
             }
         }
-        go2rtc?.terminate()
-        _ = await go2rtc?.wait()
+        let oldG = go2rtc
         go2rtc = nil
         go2rtcPID = 0
+        _ = await oldG?.stopAndWait(timeout: 2.0, escalate: false)
 
         guard let bin = AppPaths.go2rtc else { return }
         _ = try? store.writeGo2rtcYAML()

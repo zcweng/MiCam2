@@ -173,6 +173,11 @@ struct MenuContent: View {
 
     var body: some View {
         Text("MiCam2 · \(supervisor.state.label)")
+        if supervisor.state == .recording, supervisor.config.recorder.idleSparseEnabled {
+            Text("\(supervisor.actualRecordMode.label)（期望 \(supervisor.desiredRecordMode.label)）")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
         Text(supervisor.currentFile.isEmpty ? "—" : supervisor.currentFile)
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -429,6 +434,19 @@ struct StatusPane: View {
     private var statsCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             statRow("状态", supervisor.state.label)
+            if supervisor.config.recorder.idleSparseEnabled {
+                let modeText: String = {
+                    guard supervisor.state.isActive else { return "—" }
+                    if supervisor.actualRecordMode == supervisor.desiredRecordMode {
+                        return supervisor.actualRecordMode.label
+                    }
+                    return "\(supervisor.actualRecordMode.label) → 期望 \(supervisor.desiredRecordMode.label)"
+                }()
+                statRow("录制模式", modeText)
+                if supervisor.state == .recording {
+                    statRow("动静分", String(format: "%.4f", supervisor.motionScore))
+                }
+            }
             statRow("当前段", supervisor.currentFile.isEmpty ? "—" : supervisor.currentFile)
             statRow("段大小", supervisor.currentSize > 0
                     ? ByteCountFormatter.string(fromByteCount: supervisor.currentSize, countStyle: .file) : "—")

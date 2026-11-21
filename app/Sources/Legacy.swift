@@ -251,14 +251,15 @@ enum LoginItem {
     static var isEnabled: Bool { FileManager.default.fileExists(atPath: plistPath) }
 
     static func install() {
-        let app = Bundle.main.bundlePath
+        // 直接拉起 Mach-O，让 launchd 盯住真实进程；open -a 会立刻 exit 0，KeepAlive 形同虚设
+        let exec = Bundle.main.executablePath ?? (Bundle.main.bundlePath + "/Contents/MacOS/MiCam2")
         let content = """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0"><dict>
           <key>Label</key><string>com.micam2.app</string>
           <key>ProgramArguments</key><array>
-            <string>/usr/bin/open</string><string>-a</string><string>\(app)</string>
+            <string>\(exec)</string>
           </array>
           <key>RunAtLoad</key><true/>
           <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
@@ -266,6 +267,8 @@ enum LoginItem {
         </dict></plist>
         """
         try? content.write(toFile: plistPath, atomically: true, encoding: .utf8)
+        // 先卸再装，确保已加载的旧 open -a 定义被替换
+        _ = Legacy.runSync("/bin/launchctl", ["bootout", "gui/\(getuid())/com.micam2.app"])
         _ = Legacy.runSync("/bin/launchctl", ["bootstrap", "gui/\(getuid())", plistPath])
         _ = Legacy.runSync("/bin/launchctl", ["enable", "gui/\(getuid())/com.micam2.app"])
     }

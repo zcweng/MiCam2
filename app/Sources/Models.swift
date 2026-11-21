@@ -28,11 +28,35 @@ struct CameraConfig: Codable, Equatable {
     }
 }
 
+enum RecordMode: String, Equatable {
+    case motion
+    case idle
+
+    var label: String {
+        switch self {
+        case .motion: return "运动·原流"
+        case .idle: return "静止·稀疏"
+        }
+    }
+}
+
 struct RecorderConfig: Codable, Equatable {
     var segmentSeconds: Int = 300
     var readTimeoutSec: Int = 15
     var restartDelay: Int = 10
     var maxRetryDelay: Int = 300
+    /// 静止时降帧写入，运动时仍 -c copy
+    var idleSparseEnabled: Bool = true
+    /// 静止目标帧间隔（秒），约每 N 秒写 1 帧
+    var idleFrameIntervalSec: Double = 3
+    /// 亮度归一化后的平均绝对差阈值
+    var motionThreshold: Double = 0.04
+    /// 连续无动作多久才切到期望 idle
+    var idleEnterAfterSec: Int = 30
+    /// 连续有动作多久切回期望 motion
+    var motionExitAfterSec: Int = 2
+    /// 静止重编码视频码率（ffmpeg -b:v）
+    var idleVideoBitrate: String = "200k"
 }
 
 struct StorageConfig: Codable, Equatable {
@@ -104,7 +128,11 @@ extension CameraConfig {
 }
 
 extension RecorderConfig {
-    enum CodingKeys: String, CodingKey { case segmentSeconds, readTimeoutSec, restartDelay, maxRetryDelay }
+    enum CodingKeys: String, CodingKey {
+        case segmentSeconds, readTimeoutSec, restartDelay, maxRetryDelay
+        case idleSparseEnabled, idleFrameIntervalSec, motionThreshold
+        case idleEnterAfterSec, motionExitAfterSec, idleVideoBitrate
+    }
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = RecorderConfig()
@@ -112,6 +140,12 @@ extension RecorderConfig {
         readTimeoutSec = (try? c.decodeIfPresent(Int.self, forKey: .readTimeoutSec)) ?? nil ?? d.readTimeoutSec
         restartDelay = (try? c.decodeIfPresent(Int.self, forKey: .restartDelay)) ?? nil ?? d.restartDelay
         maxRetryDelay = (try? c.decodeIfPresent(Int.self, forKey: .maxRetryDelay)) ?? nil ?? d.maxRetryDelay
+        idleSparseEnabled = (try? c.decodeIfPresent(Bool.self, forKey: .idleSparseEnabled)) ?? nil ?? d.idleSparseEnabled
+        idleFrameIntervalSec = (try? c.decodeIfPresent(Double.self, forKey: .idleFrameIntervalSec)) ?? nil ?? d.idleFrameIntervalSec
+        motionThreshold = (try? c.decodeIfPresent(Double.self, forKey: .motionThreshold)) ?? nil ?? d.motionThreshold
+        idleEnterAfterSec = (try? c.decodeIfPresent(Int.self, forKey: .idleEnterAfterSec)) ?? nil ?? d.idleEnterAfterSec
+        motionExitAfterSec = (try? c.decodeIfPresent(Int.self, forKey: .motionExitAfterSec)) ?? nil ?? d.motionExitAfterSec
+        idleVideoBitrate = (try? c.decodeIfPresent(String.self, forKey: .idleVideoBitrate)) ?? nil ?? d.idleVideoBitrate
     }
 }
 
